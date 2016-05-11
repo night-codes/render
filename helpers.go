@@ -1,5 +1,3 @@
-// +build go1.6
-
 package render
 
 import (
@@ -16,6 +14,8 @@ var helperFuncs = template.FuncMap{
 		return "", fmt.Errorf("block called with no layout defined")
 	},
 	"current": func() (string, error) {
+		return "", nil
+	}, "render": func() (string, error) {
 		return "", nil
 	},
 }

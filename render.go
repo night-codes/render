@@ -6,10 +6,11 @@ import (
 	"html/template"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/valyala/fasthttp"
 )
 
 const (
@@ -45,8 +46,8 @@ type Delims struct {
 	Right string
 }
 
-// Options is a struct for specifying configuration options for the render.Render object.
-type Options struct {
+// Config is a struct for specifying configuration options for the render.Render object.
+type Config struct {
 	// Directory to load templates. Default is "templates".
 	Directory string
 	// Asset function to use in place of directory. Defaults to nil.
@@ -63,6 +64,8 @@ type Options struct {
 	Delims Delims
 	// Appends the given character set to the Content-Type header. Default is "UTF-8".
 	Charset string
+	// Gzip enable it if you want to render with gzip compression. Default is false
+	Gzip bool
 	// Outputs human readable JSON.
 	IndentJSON bool
 	// Outputs human readable XML. Default is false.
@@ -87,75 +90,86 @@ type Options struct {
 	DisableHTTPErrorRendering bool
 }
 
-// HTMLOptions is a struct for overriding some rendering Options for specific HTML call.
-type HTMLOptions struct {
-	// Layout template name. Overrides Options.Layout.
-	Layout string
-}
-
 // Render is a service that provides functions for easily writing JSON, XML,
 // binary data, and HTML templates out to a HTTP Response.
 type Render struct {
 	// Customize Secure with an Options struct.
-	opt             Options
-	templates       *template.Template
+	config *Config
+	// Templates the *template.Template main object
+	Templates       *template.Template
 	compiledCharset string
 }
 
-// New constructs a new Render instance with the supplied options.
-func New(options ...Options) *Render {
-	var o Options
-	if len(options) == 0 {
-		o = Options{}
+// New constructs a new Render instance with the supplied configs.
+func New(config ...*Config) *Render {
+	var c *Config
+	if len(config) == 0 {
+		c = &Config{}
 	} else {
-		o = options[0]
+		c = config[0]
 	}
 
-	r := Render{
-		opt: o,
+	r := &Render{
+		config: c,
 	}
 
-	r.prepareOptions()
-	r.compileTemplates()
+	r.Prepare()
+
+	return r
+}
+
+// Create constructs a new Render instance with the supplied configs. It doesn't build and prepare options yet, you should call the .Prepare for this.
+func Create(config *Config) *Render {
+	return &Render{config: config}
+}
+
+// Prepare if
+// Prepare must is called once before anything else inside the New(), this exists because for example Iris doesn't want to compile
+// the templates on Render creation but after
+func (r *Render) Prepare() {
+	r.prepareConfig()
+	if err := r.compileTemplates(); err != nil {
+		// We don't care about IsDevelopment, it's before server's run, panic
+		panic(err)
+	}
 
 	// Create a new buffer pool for writing templates into.
 	if bufPool == nil {
 		bufPool = NewBufferPool(64)
 	}
-
-	return &r
 }
 
-func (r *Render) prepareOptions() {
+func (r *Render) prepareConfig() {
 	// Fill in the defaults if need be.
-	if len(r.opt.Charset) == 0 {
-		r.opt.Charset = defaultCharset
+	if len(r.config.Charset) == 0 {
+		r.config.Charset = defaultCharset
 	}
-	r.compiledCharset = "; charset=" + r.opt.Charset
+	r.compiledCharset = "; charset=" + r.config.Charset
 
-	if len(r.opt.Directory) == 0 {
-		r.opt.Directory = "templates"
+	if len(r.config.Directory) == 0 {
+		r.config.Directory = "templates"
 	}
-	if len(r.opt.Extensions) == 0 {
-		r.opt.Extensions = []string{".tmpl"}
+	if len(r.config.Extensions) == 0 {
+		r.config.Extensions = []string{".html"}
 	}
-	if len(r.opt.HTMLContentType) == 0 {
-		r.opt.HTMLContentType = ContentHTML
+	if len(r.config.HTMLContentType) == 0 {
+		r.config.HTMLContentType = ContentHTML
 	}
 }
 
-func (r *Render) compileTemplates() {
-	if r.opt.Asset == nil || r.opt.AssetNames == nil {
-		r.compileTemplatesFromDir()
-		return
+func (r *Render) compileTemplates() error {
+	if r.config.Asset == nil || r.config.AssetNames == nil {
+		return r.compileTemplatesFromDir()
+
 	}
-	r.compileTemplatesFromAsset()
+	return r.compileTemplatesFromAsset()
 }
 
-func (r *Render) compileTemplatesFromDir() {
-	dir := r.opt.Directory
-	r.templates = template.New(dir)
-	r.templates.Delims(r.opt.Delims.Left, r.opt.Delims.Right)
+func (r *Render) compileTemplatesFromDir() error {
+	var templateErr error
+	dir := r.config.Directory
+	r.Templates = template.New(dir)
+	r.Templates.Delims(r.config.Delims.Left, r.config.Delims.Right)
 
 	// Walk the supplied directory and compile any files that match our extension list.
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -177,7 +191,7 @@ func (r *Render) compileTemplatesFromDir() {
 			ext = filepath.Ext(rel)
 		}
 
-		for _, extension := range r.opt.Extensions {
+		for _, extension := range r.config.Extensions {
 			if ext == extension {
 				buf, err := ioutil.ReadFile(path)
 				if err != nil {
@@ -185,28 +199,38 @@ func (r *Render) compileTemplatesFromDir() {
 				}
 
 				name := (rel[0 : len(rel)-len(ext)])
-				tmpl := r.templates.New(filepath.ToSlash(name))
+				tmpl := r.Templates.New(filepath.ToSlash(name))
 
 				// Add our funcmaps.
-				for _, funcs := range r.opt.Funcs {
+				for _, funcs := range r.config.Funcs {
 					tmpl.Funcs(funcs)
 				}
 
-				// Break out if this parsing fails. We don't want any silent server starts.
-				template.Must(tmpl.Funcs(helperFuncs).Parse(string(buf)))
+				if !r.config.IsDevelopment {
+					//panic in production.
+					template.Must(tmpl.Funcs(helperFuncs).Parse(string(buf)))
+				} else {
+					if _, templateErr = tmpl.Funcs(helperFuncs).Parse(string(buf)); templateErr != nil {
+						break //we dont continue to the next templates
+					}
+
+				}
+
 				break
 			}
 		}
 		return nil
 	})
+	return templateErr
 }
 
-func (r *Render) compileTemplatesFromAsset() {
-	dir := r.opt.Directory
-	r.templates = template.New(dir)
-	r.templates.Delims(r.opt.Delims.Left, r.opt.Delims.Right)
+func (r *Render) compileTemplatesFromAsset() error {
+	var templateErr error
+	dir := r.config.Directory
+	r.Templates = template.New(dir)
+	r.Templates.Delims(r.config.Delims.Left, r.config.Delims.Right)
 
-	for _, path := range r.opt.AssetNames() {
+	for _, path := range r.config.AssetNames() {
 		if !strings.HasPrefix(path, dir) {
 			continue
 		}
@@ -221,46 +245,53 @@ func (r *Render) compileTemplatesFromAsset() {
 			ext = "." + strings.Join(strings.Split(rel, ".")[1:], ".")
 		}
 
-		for _, extension := range r.opt.Extensions {
+		for _, extension := range r.config.Extensions {
 			if ext == extension {
 
-				buf, err := r.opt.Asset(path)
+				buf, err := r.config.Asset(path)
 				if err != nil {
 					panic(err)
 				}
 
 				name := (rel[0 : len(rel)-len(ext)])
-				tmpl := r.templates.New(filepath.ToSlash(name))
+				tmpl := r.Templates.New(filepath.ToSlash(name))
 
 				// Add our funcmaps.
-				for _, funcs := range r.opt.Funcs {
+				for _, funcs := range r.config.Funcs {
 					tmpl.Funcs(funcs)
 				}
 
-				// Break out if this parsing fails. We don't want any silent server starts.
-				template.Must(tmpl.Funcs(helperFuncs).Parse(string(buf)))
+				if !r.config.IsDevelopment {
+					//panic in production.
+					template.Must(tmpl.Funcs(helperFuncs).Parse(string(buf)))
+				} else {
+					if _, templateErr = tmpl.Funcs(helperFuncs).Parse(string(buf)); templateErr != nil {
+						break //we dont continue to the next templates
+					}
+				}
 				break
 			}
 		}
 	}
+	return templateErr
 }
 
 // TemplateLookup is a wrapper around template.Lookup and returns
 // the template with the given name that is associated with t, or nil
 // if there is no such template.
 func (r *Render) TemplateLookup(t string) *template.Template {
-	return r.templates.Lookup(t)
+	return r.Templates.Lookup(t)
 }
 
-func (r *Render) execute(name string, binding interface{}) (*bytes.Buffer, error) {
+func (r *Render) Execute(name string, binding interface{}) (*bytes.Buffer, error) {
 	buf := new(bytes.Buffer)
-	return buf, r.templates.ExecuteTemplate(buf, name, binding)
+	return buf, r.Templates.ExecuteTemplate(buf, name, binding)
 }
 
 func (r *Render) addLayoutFuncs(name string, binding interface{}) {
 	funcs := template.FuncMap{
 		"yield": func() (template.HTML, error) {
-			buf, err := r.execute(name, binding)
+			buf, err := r.Execute(name, binding)
 			// Return safe HTML here since we are rendering our own template.
 			return template.HTML(buf.String()), err
 		},
@@ -270,8 +301,8 @@ func (r *Render) addLayoutFuncs(name string, binding interface{}) {
 		"block": func(partialName string) (template.HTML, error) {
 			log.Print("Render's `block` implementation is now depericated. Use `partial` as a drop in replacement.")
 			fullPartialName := fmt.Sprintf("%s-%s", partialName, name)
-			if r.opt.RequireBlocks || r.TemplateLookup(fullPartialName) != nil {
-				buf, err := r.execute(fullPartialName, binding)
+			if r.config.RequireBlocks || r.TemplateLookup(fullPartialName) != nil {
+				buf, err := r.Execute(fullPartialName, binding)
 				// Return safe HTML here since we are rendering our own template.
 				return template.HTML(buf.String()), err
 			}
@@ -279,40 +310,51 @@ func (r *Render) addLayoutFuncs(name string, binding interface{}) {
 		},
 		"partial": func(partialName string) (template.HTML, error) {
 			fullPartialName := fmt.Sprintf("%s-%s", partialName, name)
-			if r.opt.RequirePartials || r.TemplateLookup(fullPartialName) != nil {
-				buf, err := r.execute(fullPartialName, binding)
+			if r.config.RequirePartials || r.TemplateLookup(fullPartialName) != nil {
+				buf, err := r.Execute(fullPartialName, binding)
 				// Return safe HTML here since we are rendering our own template.
 				return template.HTML(buf.String()), err
 			}
 			return "", nil
 		},
+		"render": func(fullPartialName string) (template.HTML, error) {
+			buf, err := r.Execute(fullPartialName, binding)
+			// Return safe HTML here since we are rendering our own template.
+			return template.HTML(buf.String()), err
+
+		},
 	}
-	if tpl := r.templates.Lookup(name); tpl != nil {
+	if tpl := r.Templates.Lookup(name); tpl != nil {
 		tpl.Funcs(funcs)
 	}
 }
 
-func (r *Render) prepareHTMLOptions(htmlOpt []HTMLOptions) HTMLOptions {
-	if len(htmlOpt) > 0 {
-		return htmlOpt[0]
+func (r *Render) prepareHTMLLayout(layout []string) string {
+	if len(layout) > 0 {
+		return layout[0]
 	}
 
-	return HTMLOptions{
-		Layout: r.opt.Layout,
-	}
+	return r.config.Layout
 }
 
 // Render is the generic function called by XML, JSON, Data, HTML, and can be called by custom implementations.
-func (r *Render) Render(w http.ResponseWriter, e Engine, data interface{}) error {
-	err := e.Render(w, data)
-	if err != nil && !r.opt.DisableHTTPErrorRendering {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+func (r *Render) Render(ctx *fasthttp.RequestCtx, e Engine, data interface{}) error {
+	var err error
+	if r.config.Gzip {
+		err = e.RenderGzip(ctx, data)
+	} else {
+		err = e.Render(ctx, data)
+	}
+
+	if err != nil && !r.config.DisableHTTPErrorRendering {
+		ctx.Response.SetBodyString(err.Error())
+		ctx.Response.SetStatusCode(fasthttp.StatusInternalServerError)
 	}
 	return err
 }
 
 // Data writes out the raw bytes as binary data.
-func (r *Render) Data(w http.ResponseWriter, status int, v []byte) error {
+func (r *Render) Data(ctx *fasthttp.RequestCtx, status int, v []byte) error {
 	head := Head{
 		ContentType: ContentBinary,
 		Status:      status,
@@ -322,39 +364,41 @@ func (r *Render) Data(w http.ResponseWriter, status int, v []byte) error {
 		Head: head,
 	}
 
-	return r.Render(w, d, v)
+	return r.Render(ctx, d, v)
 }
 
 // HTML builds up the response from the specified template and bindings.
-func (r *Render) HTML(w http.ResponseWriter, status int, name string, binding interface{}, htmlOpt ...HTMLOptions) error {
+func (r *Render) HTML(ctx *fasthttp.RequestCtx, status int, name string, binding interface{}, layout ...string) error {
 	// If we are in development mode, recompile the templates on every HTML request.
-	if r.opt.IsDevelopment {
-		r.compileTemplates()
+	if r.config.IsDevelopment {
+		if err := r.compileTemplates(); err != nil {
+			return err
+		}
 	}
 
-	opt := r.prepareHTMLOptions(htmlOpt)
+	layoutName := r.prepareHTMLLayout(layout)
 	// Assign a layout if there is one.
-	if len(opt.Layout) > 0 {
+	if len(layoutName) > 0 {
 		r.addLayoutFuncs(name, binding)
-		name = opt.Layout
+		name = layoutName
 	}
 
 	head := Head{
-		ContentType: r.opt.HTMLContentType + r.compiledCharset,
+		ContentType: r.config.HTMLContentType + r.compiledCharset,
 		Status:      status,
 	}
 
 	h := HTML{
 		Head:      head,
 		Name:      name,
-		Templates: r.templates,
+		Templates: r.Templates,
 	}
 
-	return r.Render(w, h, binding)
+	return r.Render(ctx, h, binding)
 }
 
 // JSON marshals the given interface object and writes the JSON response.
-func (r *Render) JSON(w http.ResponseWriter, status int, v interface{}) error {
+func (r *Render) JSON(ctx *fasthttp.RequestCtx, status int, v interface{}) error {
 	head := Head{
 		ContentType: ContentJSON + r.compiledCharset,
 		Status:      status,
@@ -362,17 +406,17 @@ func (r *Render) JSON(w http.ResponseWriter, status int, v interface{}) error {
 
 	j := JSON{
 		Head:          head,
-		Indent:        r.opt.IndentJSON,
-		Prefix:        r.opt.PrefixJSON,
-		UnEscapeHTML:  r.opt.UnEscapeHTML,
-		StreamingJSON: r.opt.StreamingJSON,
+		Indent:        r.config.IndentJSON,
+		Prefix:        r.config.PrefixJSON,
+		UnEscapeHTML:  r.config.UnEscapeHTML,
+		StreamingJSON: r.config.StreamingJSON,
 	}
 
-	return r.Render(w, j, v)
+	return r.Render(ctx, j, v)
 }
 
 // JSONP marshals the given interface object and writes the JSON response.
-func (r *Render) JSONP(w http.ResponseWriter, status int, callback string, v interface{}) error {
+func (r *Render) JSONP(ctx *fasthttp.RequestCtx, status int, callback string, v interface{}) error {
 	head := Head{
 		ContentType: ContentJSONP + r.compiledCharset,
 		Status:      status,
@@ -380,15 +424,15 @@ func (r *Render) JSONP(w http.ResponseWriter, status int, callback string, v int
 
 	j := JSONP{
 		Head:     head,
-		Indent:   r.opt.IndentJSON,
+		Indent:   r.config.IndentJSON,
 		Callback: callback,
 	}
 
-	return r.Render(w, j, v)
+	return r.Render(ctx, j, v)
 }
 
 // Text writes out a string as plain text.
-func (r *Render) Text(w http.ResponseWriter, status int, v string) error {
+func (r *Render) Text(ctx *fasthttp.RequestCtx, status int, v string) error {
 	head := Head{
 		ContentType: ContentText + r.compiledCharset,
 		Status:      status,
@@ -398,11 +442,11 @@ func (r *Render) Text(w http.ResponseWriter, status int, v string) error {
 		Head: head,
 	}
 
-	return r.Render(w, t, v)
+	return r.Render(ctx, t, v)
 }
 
 // XML marshals the given interface object and writes the XML response.
-func (r *Render) XML(w http.ResponseWriter, status int, v interface{}) error {
+func (r *Render) XML(ctx *fasthttp.RequestCtx, status int, v interface{}) error {
 	head := Head{
 		ContentType: ContentXML + r.compiledCharset,
 		Status:      status,
@@ -410,9 +454,9 @@ func (r *Render) XML(w http.ResponseWriter, status int, v interface{}) error {
 
 	x := XML{
 		Head:   head,
-		Indent: r.opt.IndentXML,
-		Prefix: r.opt.PrefixXML,
+		Indent: r.config.IndentXML,
+		Prefix: r.config.PrefixXML,
 	}
 
-	return r.Render(w, x, v)
+	return r.Render(ctx, x, v)
 }
