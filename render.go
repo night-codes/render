@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"html/template"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,7 +47,9 @@ type Delims struct {
 
 // Config is a struct for specifying configuration options for the render.Render object.
 type Config struct {
-	// Directory to load templates. Default is "templates".
+	// Directories to load templates. Default is ["templates"].
+	Directories []string
+	// Directory - old way to change templates directory (deprecated, please use Directories property)
 	Directory string
 	// Asset function to use in place of directory. Defaults to nil.
 	Asset func(name string) ([]byte, error)
@@ -56,10 +57,10 @@ type Config struct {
 	AssetNames func() []string
 	// Layout template name. Will not render a layout if blank (""). Defaults to blank ("").
 	Layout string
-	// Extensions to parse template files from. Defaults to [".tmpl"].
+	// Extensions to parse template files from. Defaults to [".html"].
 	Extensions []string
 	// Funcs is a slice of FuncMaps to apply to the template upon compilation. This is useful for helper functions. Defaults to [].
-	Funcs []template.FuncMap
+	Funcs template.FuncMap
 	// Delims sets the action delimiters to the specified strings in the Delims struct.
 	Delims Delims
 	// Appends the given character set to the Content-Type header. Default is "UTF-8".
@@ -146,8 +147,11 @@ func (r *Render) prepareConfig() {
 	}
 	r.compiledCharset = "; charset=" + r.config.Charset
 
-	if len(r.config.Directory) == 0 {
-		r.config.Directory = "templates"
+	if len(r.config.Directory) != 0 {
+		r.config.Directories = []string{r.config.Directory}
+	}
+	if len(r.config.Directories) == 0 {
+		r.config.Directories = []string{"templates"}
 	}
 	if len(r.config.Extensions) == 0 {
 		r.config.Extensions = []string{".html"}
@@ -167,75 +171,75 @@ func (r *Render) compileTemplates() error {
 
 func (r *Render) compileTemplatesFromDir() error {
 	var templateErr error
-	dir := r.config.Directory
-	r.Templates = template.New(dir)
+	dirs := r.config.Directories
+	r.Templates = template.New("")
 	r.Templates.Delims(r.config.Delims.Left, r.config.Delims.Right)
+	for _, dir := range dirs {
+		// Walk the supplied directory and compile any files that match our extension list.
+		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			// Fix same-extension-dirs bug: some dir might be named to: "users.tmpl", "local.html".
+			// These dirs should be excluded as they are not valid golang templates, but files under
+			// them should be treat as normal.
+			// If is a dir, return immediately (dir is not a valid golang template).
+			if info == nil || info.IsDir() {
+				return nil
+			}
 
-	// Walk the supplied directory and compile any files that match our extension list.
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		// Fix same-extension-dirs bug: some dir might be named to: "users.tmpl", "local.html".
-		// These dirs should be excluded as they are not valid golang templates, but files under
-		// them should be treat as normal.
-		// If is a dir, return immediately (dir is not a valid golang template).
-		if info == nil || info.IsDir() {
-			return nil
-		}
+			rel, err := filepath.Rel(dir, path)
+			if err != nil {
+				return err
+			}
 
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return err
-		}
+			ext := ""
+			if strings.Index(rel, ".") != -1 {
+				ext = filepath.Ext(rel)
+			}
 
-		ext := ""
-		if strings.Index(rel, ".") != -1 {
-			ext = filepath.Ext(rel)
-		}
-
-		for _, extension := range r.config.Extensions {
-			if ext == extension {
-				buf, err := ioutil.ReadFile(path)
-				if err != nil {
-					panic(err)
-				}
-
-				name := (rel[0 : len(rel)-len(ext)])
-				tmpl := r.Templates.New(filepath.ToSlash(name))
-
-				// Add our funcmaps.
-				for _, funcs := range r.config.Funcs {
-					tmpl.Funcs(funcs)
-				}
-
-				if !r.config.IsDevelopment {
-					//panic in production.
-					template.Must(tmpl.Funcs(helperFuncs).Parse(string(buf)))
-				} else {
-					if _, templateErr = tmpl.Funcs(helperFuncs).Parse(string(buf)); templateErr != nil {
-						break //we dont continue to the next templates
+			for _, extension := range r.config.Extensions {
+				if ext == extension {
+					buf, err := ioutil.ReadFile(path)
+					if err != nil {
+						panic(err)
 					}
 
-				}
+					name := (rel[0 : len(rel)-len(ext)])
+					tmpl := r.Templates.New(filepath.ToSlash(name))
 
-				break
+					// Add our funcmaps.
+					tmpl.Funcs(r.config.Funcs)
+
+					if !r.config.IsDevelopment {
+						//panic in production.
+						template.Must(tmpl.Funcs(helperFuncs).Parse(string(buf)))
+					} else {
+						if _, templateErr = tmpl.Funcs(helperFuncs).Parse(string(buf)); templateErr != nil {
+							break //we dont continue to the next templates
+						}
+
+					}
+
+					break
+				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
+	}
+
 	return templateErr
 }
 
 func (r *Render) compileTemplatesFromAsset() error {
 	var templateErr error
-	dir := r.config.Directory
-	r.Templates = template.New(dir)
+	dirs := r.config.Directories
+	r.Templates = template.New(dirs[0])
 	r.Templates.Delims(r.config.Delims.Left, r.config.Delims.Right)
 
 	for _, path := range r.config.AssetNames() {
-		if !strings.HasPrefix(path, dir) {
+		if !strings.HasPrefix(path, dirs[0]) {
 			continue
 		}
 
-		rel, err := filepath.Rel(dir, path)
+		rel, err := filepath.Rel(dirs[0], path)
 		if err != nil {
 			panic(err)
 		}
@@ -257,9 +261,7 @@ func (r *Render) compileTemplatesFromAsset() error {
 				tmpl := r.Templates.New(filepath.ToSlash(name))
 
 				// Add our funcmaps.
-				for _, funcs := range r.config.Funcs {
-					tmpl.Funcs(funcs)
-				}
+				tmpl.Funcs(r.config.Funcs)
 
 				if !r.config.IsDevelopment {
 					//panic in production.
@@ -283,6 +285,7 @@ func (r *Render) TemplateLookup(t string) *template.Template {
 	return r.Templates.Lookup(t)
 }
 
+// Execute template by name
 func (r *Render) Execute(name string, binding interface{}) (*bytes.Buffer, error) {
 	buf := new(bytes.Buffer)
 	return buf, r.Templates.ExecuteTemplate(buf, name, binding)
@@ -297,16 +300,6 @@ func (r *Render) addLayoutFuncs(name string, binding interface{}) {
 		},
 		"current": func() (string, error) {
 			return name, nil
-		},
-		"block": func(partialName string) (template.HTML, error) {
-			log.Print("Render's `block` implementation is now depericated. Use `partial` as a drop in replacement.")
-			fullPartialName := fmt.Sprintf("%s-%s", partialName, name)
-			if r.config.RequireBlocks || r.TemplateLookup(fullPartialName) != nil {
-				buf, err := r.Execute(fullPartialName, binding)
-				// Return safe HTML here since we are rendering our own template.
-				return template.HTML(buf.String()), err
-			}
-			return "", nil
 		},
 		"partial": func(partialName string) (template.HTML, error) {
 			fullPartialName := fmt.Sprintf("%s-%s", partialName, name)

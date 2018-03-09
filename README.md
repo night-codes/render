@@ -1,8 +1,5 @@
 Render is a package that provides functionality for easily rendering JSON, XML, text, binary data, and HTML templates. This package is a high-modified fork of https://github.com/unrolled/render in order to work with fasthttp, added support for gzip compression also, and a `{{ render "path/templateName"}}` func for html/template package.
 
-## Block Deprecation Notice
-Go 1.6 introduces a new [block](https://github.com/golang/go/blob/release-branch.go1.6/src/html/template/example_test.go#L128) action. This conflicts with Render's included `block` template function. To provide an easy migration path, a new function was created called `partial`. It is a duplicate of the old `block` function. It is advised that all users of the `block` function update their code to avoid any issues in the future. Previous to Go 1.6, Render's `block` functionality will continue to work but a message will be logged urging you to migrate to the new `partial` function.
-
 ## Usage
 Render can be used with pretty much any web framework providing you can access the `fasthttp.RequestCtx` from your handler. The rendering functions simply wraps Go's existing functionality for marshaling and rendering data.
 
