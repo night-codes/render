@@ -17,6 +17,8 @@ const (
 	ContentBinary = "application/octet-stream"
 	// ContentHTML header value for HTML data.
 	ContentHTML = "text/html"
+	// ContentJS header value for JS data.
+	ContentJS = "text/javascript"
 	// ContentJSON header value for JSON data.
 	ContentJSON = "application/json"
 	// ContentJSONP header value for JSONP data.
@@ -77,6 +79,8 @@ type Config struct {
 	PrefixXML []byte
 	// Allows changing of output to XHTML instead of HTML. Default is "text/html".
 	HTMLContentType string
+	// Allows changing of output to ECMAScript instead of JS. Default is "text/javascript".
+	JSContentType string
 	// If IsDevelopment is set to true, this will recompile the templates on every request. Default is false.
 	IsDevelopment bool
 	// Unescape HTML characters "&<>" to their original values. Default is false.
@@ -158,6 +162,9 @@ func (r *Render) prepareConfig() {
 	}
 	if len(r.config.HTMLContentType) == 0 {
 		r.config.HTMLContentType = ContentHTML
+	}
+	if len(r.config.JSContentType) == 0 {
+		r.config.JSContentType = ContentJS
 	}
 }
 
@@ -378,6 +385,36 @@ func (r *Render) HTML(ctx *fasthttp.RequestCtx, status int, name string, binding
 
 	head := Head{
 		ContentType: r.config.HTMLContentType + r.compiledCharset,
+		Status:      status,
+	}
+
+	h := HTML{
+		Head:      head,
+		Name:      name,
+		Templates: r.Templates,
+	}
+
+	return r.Render(ctx, h, binding)
+}
+
+// JS builds up the response from the specified template and bindings.
+func (r *Render) JS(ctx *fasthttp.RequestCtx, status int, name string, binding interface{}, layout ...string) error {
+	// If we are in development mode, recompile the templates on every JS request.
+	if r.config.IsDevelopment {
+		if err := r.compileTemplates(); err != nil {
+			return err
+		}
+	}
+
+	layoutName := r.prepareHTMLLayout(layout)
+	// Assign a layout if there is one.
+	if len(layoutName) > 0 {
+		r.addLayoutFuncs(name, binding)
+		name = layoutName
+	}
+
+	head := Head{
+		ContentType: r.config.JSContentType + r.compiledCharset,
 		Status:      status,
 	}
 
