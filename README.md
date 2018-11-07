@@ -88,6 +88,7 @@ r := render.New(render.Options{
     PrefixJSON: []byte(")]}',\n"), // Prefixes JSON responses with the given bytes.
     PrefixXML: []byte("<?xml version='1.0' encoding='UTF-8'?>"), // Prefixes XML responses with the given bytes.
     HTMLContentType: "application/xhtml+xml", // Output XHTML content type instead of default "text/html".
+    JSContentType: "text/ecmascript", // Output ECMAScript content type instead of default "text/html".
     IsDevelopment: true, // Render will now recompile the templates on every HTML response.
     UnEscapeHTML: true, // Replace ensure '&<>' are output correctly (JSON only).
     StreamingJSON: true, // Streams the JSON response via json.Encoder.
@@ -120,6 +121,7 @@ r := render.New(render.Options{
     PrefixJSON: []byte(""),
     PrefixXML: []byte(""),
     HTMLContentType: "text/html",
+    JSContentType: "text/javascript",
     IsDevelopment: false,
     UnEscapeHTML: false,
     StreamingJSON: false,
